@@ -6,11 +6,11 @@
   :license  "GNU GPL v3"
   :version "0.0.1"
   :class :package-inferred-system
-  :depends-on ("openapi2cl/core")
+  :depends-on (:split-sequence :openapi2cl/core)
   :in-order-to ((test-op (test-op "openapi2cl/tests"))))
 
 (asdf:defsystem :openapi2cl/tests
   :class :package-inferred-system
-  :depends-on ("rove"
-               "openapi2cl/tests/core")
+  :depends-on (:rove
+               :openapi2cl/tests/core)
   :perform (test-op (op c) (symbol-call :rove '#:run c)))

@@ -23,8 +23,9 @@ a 2-tuple.
 openapi: the sexp representation of a openapi document.
 client-name: the name of the class that hosts all the client methods."
   (check-type client-name symbol)
-  (let* ((host (gethash "host" openapi))
-         (base-path (gethash "basePath" openapi))
+  (let* ((servers (gethash "servers" openapi))
+         (host (gethash "url" (first servers)))
+         (base-path (or (gethash "basePath" openapi) "/"))
          (consumes-media-types (gethash "consumes" openapi))
          (produces-media-types (gethash "produces" openapi))
          (schemes (or (gethash "schemes" openapi)
@@ -35,7 +36,7 @@ client-name: the name of the class that hosts all the client methods."
      client
      (loop for path-name being the hash-keys of (gethash "paths" openapi)
              using (hash-value path-operation)
-           nconc (generate-path-methods client-name path-name path-operation
+           nconc (generate-path-methods openapi client-name path-name path-operation
                                           consumes-media-types)))))
 
 (defun with-yaml-generate (openapi-yaml client-name)
@@ -189,44 +190,50 @@ code."
                collect `(:import-from ,pkg))))
     (in-package ,package-name)))
 
-(defun generate-path-methods (client-name path-name path global-media-types)
+(defun generate-path-methods (openapi client-name path-name path global-media-types)
   (check-type client-name symbol)
   (check-type path-name string)
   (check-type path hash-table)
   (check-type global-media-types list)
-  (loop for operation-name being the hash-keys of path
-          using (hash-value operation)
-        for summary = (gethash "summary" operation)
-        for description = (gethash "description" operation)
-        for operation-id = (gethash "operationId" operation)
-        for produces-media-types = (gethash "produces" operation)
-        for consumes-media-types = (gethash "consumes" operation)
-        for responses = (gethash "responses" operation)
-        for schemes = (gethash "schemes" operation)
-        for parameters = (gethash "parameters" operation)
-        ;; Synthesized fields
-        for body-param = (find-if #'parameter-location-schema-p parameters)
-        for method-name = (if operation-id operation-id (format nil "~a-~a" operation-name path-name))
-        for required-parameters = (remove body-param (remove-if-not #'parameter-required-p parameters))
-        for optional-parameters = (remove-if #'parameter-required-p parameters)
-        ;; Enumerate through the known valid operations that we know
-        ;; how to handle. Ignore all else.
-        unless (find operation-name '("get" "put" "post" "delete"))
-          do (when body-param
+  (let (methods)
+    (flet ((collect (method)
+             (push method methods)))
+      (loop for operation-name being the hash-keys of path
+         using (hash-value operation)
+         ;; Enumerate through the known valid operations that we know
+         ;; how to handle. Ignore all else.
+         when (find operation-name '("get" "put" "post" "delete") :test 'equalp)
+         do
+           (let* ((summary (gethash "summary" operation))
+                  (description (gethash "description" operation))
+                  (operation-id (gethash "operationId" operation))
+                  (produces-media-types (gethash "produces" operation))
+                  (consumes-media-types (gethash "consumes" operation))
+                  (responses (gethash "responses" operation))
+                  (schemes (gethash "schemes" operation))
+                  (parameters (mapcar (lambda (param) (resolve-object openapi param))
+                                      (gethash "parameters" operation)))
+                  ;; Synthesized fields
+                  (body-param (find-if #'parameter-location-schema-p parameters))
+                  (method-name (if operation-id operation-id (format nil "~a-~a" operation-name path-name)))
+                  (required-parameters (remove body-param (remove-if-not #'parameter-required-p parameters)))
+                  (optional-parameters (remove-if #'parameter-required-p parameters)))
+             (when body-param
                (multiple-value-bind (required-body-params optional-body-params)
                    (generate-schema-object-parameters (gethash "schema" body-param))
                  (setf required-parameters (append required-parameters required-body-params)
                        optional-parameters (append optional-parameters optional-body-params))))
-        collect (let* ((param-descriptions (generate-parameter-comments (append required-parameters
-                                                                                optional-parameters)))
-                       (method-comment (concatenate 'string
-                                                    (when summary (format nil "~a~%~%" summary))
-                                                    (when description (format nil "~a~%~%" description))
-                                                    (when param-descriptions param-descriptions))))
-                  ;; Generate a method for each operation
-                  (generate-operation-method client-name method-name method-comment schemes path-name
-                                             operation-name global-media-types consumes-media-types
-                                             produces-media-types required-parameters optional-parameters))))
+             (collect (let* ((param-descriptions (generate-parameter-comments (append required-parameters
+                                                                                      optional-parameters)))
+                             (method-comment (concatenate 'string
+                                                          (when summary (format nil "~a~%~%" summary))
+                                                          (when description (format nil "~a~%~%" description))
+                                                          (when param-descriptions param-descriptions))))
+                        ;; Generate a method for each operation
+                        (generate-operation-method client-name method-name method-comment schemes path-name
+                                                   operation-name global-media-types consumes-media-types
+                                                   produces-media-types required-parameters optional-parameters)))))
+      methods)))
 
 (defun generate-client (client-name schemes host base-path consumes-media-types produces-media-types)
   "Generates a client that all the methods will hang off of."
@@ -391,6 +398,31 @@ the provided values meet any defined constraints."
                                                 cl-user::req-body)))
                         ,@(when query-params `(:parameters cl-user::query-params))
                         ,@(when form-params `(:multipart-params cl-user::form-params)))))))))
+
+(defun read-path (path-string)
+  (split-sequence:split-sequence #\/ path-string))
+
+(defun access-path (object path)
+  (let ((path (if (stringp path)
+                  (read-path path)
+                  path)))
+    (let ((result (if (equalp (first path) "#")
+                      object
+                      (error "Don't know how to resolve: ~A" path))))
+      (loop for part in (rest path) do
+           (setf result (gethash part result)))
+      result)))
+
+(defun resolve-$ref (openapi $ref)
+  "Returns the referenced object"
+  (or (access-path openapi $ref)
+      (error "Reference not found: ~a" $ref)))
+
+(defun resolve-object (openapi object)
+  "If object is a reference, then return the referenced object. Otherwise, just return the object."
+  (if (not (null (gethash "$ref" object)))
+      (resolve-$ref openapi (gethash "$ref" object))
+      object))
 
 (defun generate-check-type (parameters)
   (check-type parameters list)
